@@ -3,11 +3,11 @@
 #   codex execpolicy check --rules agentchat.rules -- achat inbox
 # 폴더 경로로 직접 실행한다면 아래 두 번째 규칙의 경로를 실제 위치로 바꾼다.
 prefix_rule(
-    pattern = ["achat", ["send", "inbox", "log", "wait", "status"]],
+    pattern = ["achat", ["send", "inbox", "log", "wait", "status", "who"]],
     decision = "allow",
     justification = "agentchat 메시지 도구",
 )
 # prefix_rule(
-#     pattern = ["py", "-3", "C:/tools/agentchat/agentchat.py", ["send", "inbox", "log", "wait", "status"]],
+#     pattern = ["py", "-3", "C:/tools/agentchat/agentchat.py", ["send", "inbox", "log", "wait", "status", "who"]],
 #     decision = "allow",
 # )

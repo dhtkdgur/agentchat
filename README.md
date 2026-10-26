@@ -38,25 +38,31 @@ Windows에서 `python`을 치면 Microsoft Store 안내가 뜨는 경우가 많�
    ```
    [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\tools\agentchat", "User")
    ```
-3. 프로젝트 폴더에서 `achat init`을 한 번 실행합니다. 이어서 창마다 폴더를 나누고 `achat me <이름>`으로 이름을 정합니다.
+3. 프로젝트 폴더에서 `achat init`을 한 번 실행하고, 에이전트를 추가합니다. 폴더, 이름 파일, 지침, 훅, Codex 승인 규칙을 한 번에 만들고 기존 `CLAUDE.md`/`.claude/settings.json` 같은 파일은 지우지 않고 우리 부분만 더합니다. (UI의 "+ 에이전트"로도 같습니다.)
    ```
-   cd <프로젝트>         ; achat init ; achat me claude
-   cd <프로젝트>/codex   ; achat me codex
-   cd <프로젝트>/gemini  ; achat me gemini
+   cd <프로젝트>
+   achat init
+   achat add boss  --kind claude     # 첫 에이전트는 프로젝트 폴더 자체를 씁니다
+   achat add coder --kind codex      # 그 외는 <프로젝트>/<이름>/ 폴더 (--dir 로 지정, 프로젝트 안만 가능)
+   achat add g     --kind agy        # gemini 도 같은 뜻
+   achat who                         # 등록된 에이전트와 안 읽은 개수
    ```
-4. 훅 설정을 출력해서 각 에이전트 설정 파일에 합칩니다. Windows에서 `python`이 없으면 `--python "py -3"`을 붙입니다.
-   - Claude Code: `achat print-config --target claude` → `.claude/settings.json`의 `hooks`
-   - Codex: `achat print-config --target codex` → `.codex/hooks.json`. Windows에서는 각 훅에 `commandWindows`를 따로 지정해야 할 수 있습니다. 적용 후 Codex에서 `/hooks`로 신뢰 확인을 합니다.
-   - Antigravity CLI(`agy`)와 Gemini CLI: `agy`는 훅 형식이 달라서 지금은 훅을 쓰지 않습니다(아래 5번의 지침만 사용). Gemini CLI용은 `print-config --target gemini`(미검증).
-5. 에이전트 지침을 만듭니다. 출력 문구를 각 폴더의 `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`에 붙입니다.
-   ```
-   achat print-rules --target claude --name claude --cmd achat
-   achat print-rules --target codex  --name codex  --cmd achat
-   achat print-rules --target gemini --name gemini --cmd achat
-   ```
+   종류는 `claude`, `codex`, `agy`입니다. 같은 종류를 여러 명 추가해도 됩니다. 깨우기는 이름이 아니라 종류로 정해집니다.
+4. 각 에이전트 폴더에서 해당 CLI를 실행합니다(UI의 "창 열기"도 같습니다). Codex는 처음 한 번 `/hooks`에서 훅을 신뢰하고 아무 입력을 한 번 해야 세션이 등록됩니다.
+5. 지침 문구와 훅 설정만 직접 보고 싶으면 `achat print-rules`와 `achat print-config`가 같은 내용을 출력합니다. 지침에는 상대 이름이 박혀 있지 않고 `who`를 보게 되어 있어서, 나중에 에이전트를 추가해도 기존 창의 지침을 고칠 필요가 없습니다.
+   - 같은 프로젝트 안에서 같은 종류를 상위/하위 폴더에 두면, 상위 폴더의 `CLAUDE.md`/`AGENTS.md`가 하위 에이전트에게도 읽힙니다. 그래서 지침에 "가장 가까운 `.agentchat-me`가 내 이름"이라고 적어 두었습니다.
 6. (선택) Codex 승인 반복을 없애려면 `skill/codex-agentchat.rules`를 프로젝트의 `.codex/rules/`에 둡니다. 적용 확인: `codex execpolicy check --rules <파일> -- achat inbox`.
 7. (선택) agy 승인 반복을 없애려면 `~/.gemini/antigravity-cli/settings.json`의 `permissions.allow`에 `skill/agy-settings-snippet.json`의 규칙을 넣고 agy를 다시 켭니다. agy는 `send`의 본문까지 명령에 포함되므로 접두사 규칙으로는 안 먹고 `regex:`가 필요합니다. 경로(`D:/…/agentchat\.py`)는 본인 설치 위치로 바꾸세요. `pause`/`resume` 같은 제어 명령은 일부러 허용하지 않습니다.
-8. 별도 터미널에서 `achat watch`를 켜 두면 대화가 보입니다.
+8. 별도 터미널에서 `achat watch`(글자)나 `achat ui`(브라우저 화면)를 켜 두면 대화가 보입니다.
+
+## UI (`achat ui`)
+- `achat ui` 한 줄이면 기본 브라우저에 `http://127.0.0.1:8765/` 탭이 열립니다. 끝낼 때는 터미널에서 Ctrl+C. 주소창 없는 독립 앱 창으로 쓰고 싶으면 `achat ui --app`(Edge/Chrome 필요, 창을 닫으면 서버도 같이 끝남).
+- 바탕화면에서 클릭 한 번으로 열려면 `achat shortcut`(Windows)으로 바로가기를 만듭니다. 더블클릭하면 콘솔 없이 기본 브라우저로 열리고, 탭을 닫고 10분이 지나면 서버가 스스로 끝납니다. 어느 폴더에서 `achat ui`를 실행하든 그 폴더가 프로젝트 목록(`~/.agentchat/projects.json`)에 등록되고, 바로가기로 열면 마지막 프로젝트가 열립니다.
+- 화면 위쪽 목록에서 프로젝트를 바꾸거나 "＋ 프로젝트 폴더 추가…"로 새 폴더를 추가합니다(폴더 선택 창 또는 경로 입력).
+- "+ 에이전트"를 누르고 모델(Claude Code, Codex, Antigravity)을 고르면 `add`와 똑같이 폴더, 지침, 훅을 만들고 "창 열기"로 그 폴더에서 해당 CLI를 새 터미널로 띄웁니다. 같은 모델을 여러 명 추가할 수 있습니다(`codex`, `codex2`…).
+- 대화 화면: 에이전트별 색, 보낸 사람 → 받는 사람, 주제 필터, 검색, 안 읽은 개수, 일시정지 표시. 1초마다 갱신합니다.
+- 보안: `127.0.0.1`에만 열립니다. 쓰기 요청(프로젝트 추가, 에이전트 추가, 창 열기)은 서버를 켤 때마다 새로 만드는 일회용 토큰이 있어야 하고, Host·Origin이 다르면 거절합니다(다른 웹사이트가 이 서버를 부리지 못하게). 띄울 수 있는 명령은 `claude`, `codex`, `agy` 세 개로 고정이고 폴더는 등록된 프로젝트 안으로 제한합니다. 메시지 본문은 `textContent`로만 넣어서 스크립트가 실행되지 않습니다. 메시지를 보내거나 읽음 처리하는 기능은 없습니다.
+- 옵션: `--port 9000`(사용 중이면 다음 번호), `--no-open`(창을 열지 않음), `--app`(앱 창), `--idle-exit 600`(화면이 없으면 종료).
 
 ## 사용
 ```
@@ -72,10 +78,11 @@ achat status
 - 예전 문법(`send --from A --to B "내용"`, `inbox --agent X`)도 그대로 됩니다.
 
 ## 검증 상태
-- `python test_agentchat.py`: 72개. Linux(Python 3.10)와 Windows(Python 3.14)에서 모두 통과했습니다.
+- `python test_agentchat.py`: 95개. Linux(Python 3.10)에서 통과했고, 이전 버전의 72개는 Windows(Python 3.14)에서도 통과했습니다.
 - 이전 버전에서 Windows 실기로 확인됨: 한글 경로 포함 `init`/`send`/`inbox`, Claude Code와 Codex의 `UserPromptSubmit` 훅 수신, Claude Code·`agy`의 백그라운드 `wait` 종료 시 자동 재시작과 답장, `codex queue`로 쉬는 Codex 창 깨우기.
 - Windows 실기 확인(3자 대화): Claude Code가 codex·gemini에게 보내고, codex는 `codex queue`로, gemini(agy)와 Claude는 백그라운드 `wait`로 깨어나 입력 없이 답장했습니다(codex 약 8초, gemini 약 26초). 읽음 위치가 어긋나는 유실 없음, `errors.log` 비어 있음, codex 세션 자동 등록 확인.
 - 승인 팝업: Codex·Claude 창은 이번 테스트에서 뜨지 않았습니다. agy는 허용 규칙 없이는 `send`마다 뜨고, `skill/agy-settings-snippet.json`의 `regex:` 규칙을 넣으면 뜨지 않음을 확인했습니다.
+- `add`, `who`, 프로젝트 전환, UI의 에이전트 추가는 Linux에서 단위 테스트와 Chromium 클릭 테스트까지 했습니다. Windows 실기 확인(브라우저 열기, `창 열기`, 바탕화면 바로가기, `--app`)은 남아 있습니다.
 - 미검증: `PostToolUse` 훅, Gemini CLI용 훅 설정, 긴 대화에서의 루프 지침 준수, Claude Code 허용 목록 설정.
 - 에이전트 CLI 버전이 바뀌면 훅 형식이 달라질 수 있습니다. 깨지면 `print-config` 출력과 공식 훅 문서를 비교해 수정하세요.
 - 처음 쓸 때는 한 쌍으로 `send` → 상대 창에서 아무 입력(Codex는 최초 1회) → 메시지 도착 여부부터 확인하세요.

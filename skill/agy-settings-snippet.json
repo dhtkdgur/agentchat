@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "command(regex:(achat|py -3 \"D:/path/to/agentchat\\.py\") (send|inbox|wait|log|status|me)( .*)?)"
+      "command(regex:(achat|py -3 \"D:/path/to/agentchat\\.py\") (send|inbox|wait|log|status|me|who)( .*)?)"
     ]
   }
 }

@@ -6,12 +6,28 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import agentchat as ac  # noqa: E402
 
 SCRIPT = os.path.join(HERE, "agentchat.py")
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def read_json(path):
+    return json.loads(read_text(path))
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
 
 
 class Base(unittest.TestCase):
@@ -387,6 +403,8 @@ class TestCLI(Base):
         finally:
             if p.poll() is None:
                 p.kill()
+            for f in (p.stdin, p.stdout, p.stderr):
+                f.close()
         self.assertLess(time.time() - t0, 10)
         self.assertEqual(p.returncode, 0)
 
@@ -514,7 +532,8 @@ class TestShortCLI(Base):
             self.assertIn("`ac send <상대>", out)
             self.assertIn("내 이름은 `%s`" % target, out)
             self.assertIn(needle, out)
-        self.assertNotIn("`claude`, `claude`", self.run_cli("print-rules", "--target", "claude", "--cmd", "ac"))
+        self.assertIn("`ac who`", self.run_cli("print-rules", "--target", "claude", "--cmd", "ac"))
+        self.assertIn("`codex`, `gemini`", self.run_cli("print-rules", "--target", "claude", "--name", "claude", "--others", "claude,codex,gemini", "--cmd", "ac"))
 
 
 class TestWaitNotify(Base):
@@ -655,6 +674,297 @@ class TestWake(Base):
         code, out = self.send("claude", "codex", "hi")
         self.assertEqual(code, ac.EXIT_OK)
         self.assertIn("깨우지 못했습니다", out)
+
+
+class TestUI(Base):
+    ENV_KEYS = Base.ENV_KEYS + ("AGENTCHAT_HOME",)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "proj")
+        self.d = os.path.join(self.root, ".collab", "chat")
+        ac.cmd_init(self.d)
+        self.clean_env()
+        os.environ["AGENTCHAT_HOME"] = os.path.join(self.tmp.name, "home")
+        ac.register_project(self.root)
+        self.launched = []
+        self._orig = (ac.launch_terminal, ac.pick_folder)
+        ac.launch_terminal = lambda folder, kind, name: (self.launched.append((folder, kind, name)) or (True, "열었습니다."))
+        ac.pick_folder = lambda: (os.path.join(self.tmp.name, "picked"), "")
+        self.srv = ac.make_ui_server(0)
+        self.port = self.srv.server_address[1]
+        self.th = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.th.start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        ac.launch_terminal, ac.pick_folder = self._orig
+        super().tearDown()
+
+    def req(self, path, method="GET", host=None, body=None, token="ok", headers=None, ctype="application/json"):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            h = {}
+            if host:
+                h["Host"] = host
+            if method == "POST":
+                h["Content-Type"] = ctype
+                if token == "ok":
+                    h["X-Token"] = self.srv.token
+                elif token:
+                    h["X-Token"] = token
+            h.update(headers or {})
+            data = json.dumps(body).encode("utf-8") if isinstance(body, (dict, list)) else body
+            c.request(method, path, body=data, headers=h)
+            r = c.getresponse()
+            raw = r.read().decode("utf-8")
+            return r.status, raw, r
+        finally:
+            c.close()
+
+    def post(self, path, body, **kw):
+        code, raw, _ = self.req(path, "POST", body=body, **kw)
+        try:
+            return code, json.loads(raw)
+        except ValueError:
+            return code, {}
+
+    def q(self, extra=""):
+        return "/api/state?p=%s%s" % (urllib.parse.quote(self.root), extra)
+
+    def test_state_incremental_and_unread(self):
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        self.send("claude", "codex", "하나", topic="a")
+        self.send("codex", "claude", "둘", topic="a")
+        st = ac.ui_state(self.d)
+        self.assertEqual([m["id"] for m in st["messages"]], [1, 2])
+        self.assertEqual(st["agents"]["codex"]["unread"], 1)
+        self.assertEqual(st["agents"]["claude"]["unread"], 1)
+        self.assertTrue(st["agents"]["coder"]["openable"])
+        self.assertEqual(st["agents"]["coder"]["label"], "Codex")
+        self.assertFalse(st["agents"]["claude"]["openable"])
+        self.assertEqual(ac.ui_state(self.d, after=1)["messages"][0]["id"], 2)
+        self.assertEqual(ac.ui_state(self.d, after=2)["messages"], [])
+
+    def test_state_does_not_mark_read(self):
+        self.send("claude", "codex", "x")
+        ac.ui_state(self.d)
+        self.assertIn("x", ac.cmd_inbox(self.d, "codex")[1])
+
+    def test_page_has_token_and_no_innerhtml(self):
+        code, body, r = self.req("/")
+        self.assertEqual(code, 200)
+        self.assertIn(self.srv.token, body)
+        self.assertNotIn("__TOKEN__", body)
+        self.assertNotIn("innerHTML", body)
+        self.assertIn("default-src 'none'", r.getheader("Content-Security-Policy"))
+
+    def test_http_state_and_unregistered_project(self):
+        self.send("claude", "codex", "<script>alert(1)</script>")
+        code, body, _ = self.req(self.q("&after=0"))
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["messages"][0]["body"], "<script>alert(1)</script>")
+        self.assertEqual(self.req(self.q("&after=abc"))[0], 200)
+        self.assertEqual(self.req("/api/state?p=" + urllib.parse.quote(self.tmp.name))[0], 404)
+        self.assertEqual(self.req("/api/state?p=" + urllib.parse.quote(self.root + "/../"))[0], 404)
+        self.assertEqual(self.req("/api/state")[0], 404)
+        self.assertEqual(self.req("/nope")[0], 404)
+        code, body, _ = self.req("/api/projects")
+        self.assertEqual(json.loads(body)["default"], self.root)
+
+    def test_foreign_host_and_write_guards(self):
+        self.assertEqual(self.req("/", host="evil.example.com")[0], 403)
+        self.assertEqual(self.req("/api/projects", host="evil.example.com:80")[0], 403)
+        self.assertEqual(self.req("/", host="localhost:%d" % self.port)[0], 200)
+        body = {"p": self.root, "name": "boss", "kind": "claude"}
+        self.assertEqual(self.post("/api/agent/add", body, token=None)[0], 403)
+        self.assertEqual(self.post("/api/agent/add", body, token="wrong")[0], 403)
+        self.assertEqual(self.post("/api/agent/add", body, host="evil.example.com")[0], 403)
+        self.assertEqual(self.post("/api/agent/add", body, headers={"Origin": "http://evil.example.com"})[0], 403)
+        self.assertEqual(self.post("/api/agent/add", body, ctype="text/plain")[0], 415)
+        self.assertEqual(self.post("/api/agent/add", b"x" * 5000)[0], 413)
+        self.assertEqual(self.req("/api/agent/add", "PUT")[0], 405)
+        self.assertEqual(ac.load_roster(self.d), {})
+
+    def test_add_and_open_agent_via_http(self):
+        code, j = self.post("/api/agent/add", {"p": self.root, "name": "boss", "kind": "claude", "open": True})
+        self.assertTrue(j["ok"], j)
+        self.assertIn("boss", ac.load_roster(self.d))
+        self.assertEqual(self.launched, [(os.path.realpath(self.root), "claude", "boss")])
+        code, j = self.post("/api/agent/add", {"p": self.root, "name": "Bad Name", "kind": "claude"})
+        self.assertFalse(j["ok"])
+        code, j = self.post("/api/agent/add", {"p": self.tmp.name, "name": "x", "kind": "claude"})
+        self.assertEqual(code, 404)
+        code, j = self.post("/api/agent/open", {"p": self.root, "name": "boss"})
+        self.assertTrue(j["ok"])
+        self.assertEqual(len(self.launched), 2)
+        code, j = self.post("/api/agent/open", {"p": self.root, "name": "ghost"})
+        self.assertFalse(j["ok"])
+        self.assertEqual(len(self.launched), 2)
+
+    def test_open_ignores_tampered_roster(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        r = ac.load_roster(self.d)
+        r["boss"]["kind"] = "rm -rf"
+        ac.save_roster(self.d, r)
+        self.assertEqual(ac.agent_folder(self.d, "boss"), (None, None))
+        r["boss"] = {"kind": "claude", "dir": "../.."}
+        ac.save_roster(self.d, r)
+        self.assertEqual(ac.agent_folder(self.d, "boss"), (None, None))
+
+    def test_project_add_and_pick(self):
+        newp = os.path.join(self.tmp.name, "second")
+        os.makedirs(newp)
+        code, j = self.post("/api/project/add", {"path": newp})
+        self.assertTrue(j["ok"], j)
+        self.assertTrue(os.path.isdir(os.path.join(newp, ".collab", "chat")))
+        self.assertEqual([p["path"] for p in ac.load_projects()][0], os.path.abspath(newp))
+        self.assertEqual(self.req(self.q())[0], 200)
+        code, j = self.post("/api/project/add", {"path": os.path.join(self.tmp.name, "nope")})
+        self.assertFalse(j["ok"])
+        code, j = self.post("/api/pick", {})
+        self.assertTrue(j["ok"])
+
+    def test_cmd_ui_exits_by_itself_when_page_is_gone(self):
+        t0 = time.time()
+        code, _ = ac.cmd_ui(self.d, 0, True, False, idle_exit=1.5)
+        self.assertEqual(code, ac.EXIT_OK)
+        self.assertLess(time.time() - t0, 8)
+
+    def test_last_seen_updates_on_get(self):
+        before = self.srv.last_seen
+        time.sleep(0.05)
+        self.req("/api/projects")
+        self.assertGreater(self.srv.last_seen, before)
+
+    def test_port_fallback(self):
+        s2 = ac.make_ui_server(self.port)
+        try:
+            self.assertNotEqual(s2.server_address[1], self.port)
+            self.assertNotEqual(s2.token, self.srv.token)
+        finally:
+            s2.server_close()
+
+    def test_projects_registry_drops_missing_folders(self):
+        gone = os.path.join(self.tmp.name, "gone")
+        os.makedirs(gone)
+        ac.register_project(gone)
+        self.assertEqual(len(ac.load_projects()), 2)
+        os.rmdir(gone)
+        self.assertEqual([p["path"] for p in ac.load_projects()], [os.path.abspath(self.root)])
+
+    @unittest.skipIf(os.name == "nt", "비 Windows 에서만")
+    def test_shortcut_refused_off_windows(self):
+        self.assertEqual(ac.cmd_shortcut()[0], ac.EXIT_ERR)
+
+
+class TestRoster(Base):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "proj")
+        self.d = os.path.join(self.root, ".collab", "chat")
+        ac.cmd_init(self.d)
+        self.clean_env()
+
+    def project(self):
+        return self.root
+
+    def test_add_creates_files_and_roster(self):
+        code, out = ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        self.assertEqual(code, ac.EXIT_OK, out)
+        root = self.project()
+        self.assertEqual(read_text(os.path.join(root, ".agentchat-me")).strip(), "boss")
+        self.assertIn("`achat who`", read_text(os.path.join(root, "CLAUDE.md")))
+        hooks = read_json(os.path.join(root, ".claude", "settings.json"))["hooks"]
+        self.assertIn("hook --agent boss --event prompt", hooks["UserPromptSubmit"][0]["hooks"][0]["command"])
+        code, out = ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        self.assertEqual(code, ac.EXIT_OK, out)
+        sub = os.path.join(root, "coder")
+        self.assertTrue(os.path.isfile(os.path.join(sub, "AGENTS.md")))
+        self.assertTrue(os.path.isfile(os.path.join(sub, ".codex", "rules", "agentchat.rules")))
+        h = read_json(os.path.join(sub, ".codex", "hooks.json"))["hooks"]
+        self.assertIn("--agent coder", h["UserPromptSubmit"][0]["hooks"][0]["commandWindows"])
+
+    def test_many_codex_agents_wake_by_kind(self):
+        ac.cmd_add(self.d, "c1", "codex", None, "achat")
+        ac.cmd_add(self.d, "c2", "codex", None, "achat")
+        self.assertEqual(ac.kind_of(self.d, "c1"), "codex")
+        self.assertEqual(ac.kind_of(self.d, "c2"), "codex")
+        sid = "019aaaaa-bbbb-7ccc-8ddd-000000000002"
+        ac.cmd_hook(self.d, "c2", "prompt", {"session_id": sid})
+        self.assertEqual(ac.load_agent(self.d, "c2").get("session_id"), sid)
+        self.assertEqual(ac.load_agent(self.d, "c1"), {})
+
+    def test_legacy_names_still_work_and_unknown_is_none(self):
+        self.assertEqual(ac.kind_of(self.d, "codex"), "codex")
+        self.assertEqual(ac.kind_of(self.d, "gemini"), "agy")
+        self.assertIsNone(ac.kind_of(self.d, "someone"))
+
+    def test_add_validation(self):
+        self.assertEqual(ac.cmd_add(self.d, "Bad Name", "claude")[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_add(self.d, "ok", "nokind")[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_add(self.d, "a", "claude", None, "achat")[0], ac.EXIT_OK)
+        self.assertEqual(ac.cmd_add(self.d, "a", "claude", None, "achat")[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_add(self.d, "z", "codex", "../outside", "achat")[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_add(self.d, "y", "codex", "a", "achat")[0], ac.EXIT_OK)  # 폴더 'a' 는 아직 .agentchat-me 없음
+
+    def test_folder_owned_by_other_agent_is_refused(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        code, out = ac.cmd_add(self.d, "other", "claude", ".", "achat")
+        self.assertEqual(code, ac.EXIT_ERR)
+        self.assertIn("boss", out)
+
+    def test_instruction_block_is_idempotent_and_keeps_user_text(self):
+        root = self.project()
+        path = os.path.join(root, "CLAUDE.md")
+        write_text(path, "# 내 프로젝트 규칙\n- 들여쓰기 2칸\n")
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        first = read_text(path)
+        ac.write_block(path, "교체된 내용")
+        second = read_text(path)
+        self.assertIn("들여쓰기 2칸", second)
+        self.assertEqual(second.count(ac.BLOCK_START), 1)
+        self.assertIn("교체된 내용", second)
+        self.assertNotIn("내 이름은", second)
+        self.assertIn("내 이름은", first)
+
+    def test_existing_hooks_are_merged_not_overwritten(self):
+        root = self.project()
+        os.makedirs(os.path.join(root, ".claude"))
+        sp = os.path.join(root, ".claude", "settings.json")
+        write_text(sp, json.dumps({"model": "x", "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}))
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        ac.cmd_add(self.d, "boss2", "claude", "b2", "achat")
+        data = read_json(sp)
+        cmds = [h["command"] for e in data["hooks"]["UserPromptSubmit"] for h in e["hooks"]]
+        self.assertEqual(data["model"], "x")
+        self.assertIn("echo mine", cmds)
+        self.assertEqual(len([c for c in cmds if "--agent boss " in c]), 1)
+
+    def test_broken_settings_file_is_left_alone(self):
+        root = self.project()
+        os.makedirs(os.path.join(root, ".claude"))
+        sp = os.path.join(root, ".claude", "settings.json")
+        write_text(sp, "{ not json")
+        code, out = ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        self.assertEqual(code, ac.EXIT_OK)
+        self.assertIn("건드리지 않았습니다", out)
+        self.assertEqual(read_text(sp), "{ not json")
+
+    def test_who_lists_agents_and_unread(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        self.send("boss", "coder", "hi")
+        out = ac.cmd_who(self.d)[1]
+        self.assertIn("coder  Codex", out)
+        self.assertIn("안 읽음 1", out)
+        self.assertIn("세션 미등록", out)
+
+    def test_hook_cli_agent_optional_via_identity_file(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        self.assertEqual(ac.resolve_agent(None), None if not ac.find_identity()[0] else ac.find_identity()[0])
 
 
 if __name__ == "__main__":
