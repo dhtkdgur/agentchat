@@ -589,6 +589,24 @@ class TestLog(Base):
         self.assertIn("m3", out)
         self.assertNotIn("m2", out)
 
+    def test_topic_counts_matches_topic_count(self):
+        self.send("a", "b", "1", topic="x")
+        self.send("b", "a", "2", topic="x")
+        self.send("a", "b", "3", topic="y")
+        ac.cmd_send(self.d, "", "a", "x", "사람", human=True)
+        ac.cmd_reset_topic(self.d, "y")
+        self.send("a", "b", "4", topic="y")
+        msgs = ac.read_messages(self.d)
+        counts = ac.topic_counts(msgs)
+        for t in ("x", "y"):
+            self.assertEqual(counts[t], ac.topic_count(msgs, t))
+        self.assertEqual(counts, {"x": 2, "y": 1})
+
+    def test_watch_on_uninitialized_folder_returns(self):
+        code, out = ac.cmd_watch(os.path.join(self.tmp.name, "nope"))
+        self.assertEqual(code, ac.EXIT_OK)
+        self.assertIn("초기화", out)
+
 
 class TestWake(Base):
     SID = "01a17661-a0e3-7552-b9fd-f88d7f719b9a"
@@ -859,6 +877,22 @@ class TestUI(Base):
         code, j = self.post("/api/project/remove", {"path": self.root}, token=None)
         self.assertEqual(code, 403)
 
+    def test_send_long_korean_body_via_http(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        body = "가" * 3000
+        code, j = self.post("/api/send", {"p": self.root, "to": ["boss"], "topic": "긴글", "body": body})
+        self.assertEqual(code, 200)
+        self.assertTrue(j["ok"], j)
+        self.assertEqual(ac.read_messages(self.d)[-1]["body"], body)
+
+    def test_status_lists_roster_agents_without_cursor(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        self.send("boss", "coder", "x")
+        _, out = ac.cmd_status(self.d)
+        self.assertIn("boss: 안 읽은 메시지 0개", out)
+        self.assertIn("coder: 안 읽은 메시지 1개", out)
+
     def test_state_does_not_mark_read(self):
         self.send("claude", "codex", "x")
         ac.ui_state(self.d)
@@ -869,6 +903,8 @@ class TestUI(Base):
         self.assertEqual(code, 200)
         self.assertIn(self.srv.token, body)
         self.assertNotIn("__TOKEN__", body)
+        self.assertNotIn("__MAXBODY__", body)
+        self.assertNotIn("__KINDS__", body)
         self.assertNotIn("innerHTML", body)
         self.assertIn("default-src 'none'", r.getheader("Content-Security-Policy"))
 
@@ -895,7 +931,7 @@ class TestUI(Base):
         self.assertEqual(self.post("/api/agent/add", body, host="evil.example.com")[0], 403)
         self.assertEqual(self.post("/api/agent/add", body, headers={"Origin": "http://evil.example.com"})[0], 403)
         self.assertEqual(self.post("/api/agent/add", body, ctype="text/plain")[0], 415)
-        self.assertEqual(self.post("/api/agent/add", b"x" * 5000)[0], 413)
+        self.assertEqual(self.post("/api/agent/add", b"x" * (ac.UI_BODY_MAX + 1))[0], 413)
         self.assertEqual(self.req("/api/agent/add", "PUT")[0], 405)
         self.assertEqual(ac.load_roster(self.d), {})
 
@@ -1076,6 +1112,545 @@ class TestRoster(Base):
     def test_hook_cli_agent_optional_via_identity_file(self):
         ac.cmd_add(self.d, "boss", "claude", None, "achat")
         self.assertEqual(ac.resolve_agent(None), None if not ac.find_identity()[0] else ac.find_identity()[0])
+
+
+class TestApprovalCore(Base):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "proj")
+        self.d = os.path.join(self.root, ".collab", "chat")
+        ac.cmd_init(self.d)
+        self.clean_env()
+        os.environ.pop("AGENTCHAT_APPROVAL_WAIT", None)
+
+    def tearDown(self):
+        os.environ.pop("AGENTCHAT_APPROVAL_WAIT", None)
+        super().tearDown()
+
+    def payload(self, cmd="npm test", tool="Bash"):
+        return {"hook_event_name": "PermissionRequest", "tool_name": tool, "cwd": self.root,
+                "tool_input": {"command": cmd, "description": "테스트 실행"}}
+
+    def run_hook(self, agent="boss", payload=None):
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault(
+            "r", ac.cmd_approval_hook(self.d, agent, payload or self.payload(), interval=0.05)))
+        t.start()
+        return t, box
+
+    def wait_pending(self, n=1):
+        for _ in range(200):
+            reqs = ac.list_approvals(self.d)
+            if len(reqs) >= n:
+                return reqs
+            time.sleep(0.02)
+        self.fail("요청이 생기지 않았습니다")
+
+    def test_danger_of(self):
+        self.assertEqual(ac.danger_of("Bash", {"command": "npm test"}), [])
+        self.assertEqual(ac.danger_of("Bash", {"command": "ls -la && git status"}), [])
+        self.assertIn("삭제", ac.danger_of("Bash", {"command": "rm -rf build"}))
+        self.assertIn("삭제", ac.danger_of("PowerShell", {"command": "Remove-Item -Recurse x"}))
+        self.assertIn("외부 전송(git push)", ac.danger_of("Bash", {"command": "git push origin main"}))
+        self.assertIn("되돌리기 어려운 git 작업", ac.danger_of("Bash", {"command": "git push --force"}))
+        self.assertIn("외부 전송·접속", ac.danger_of("Bash", {"command": "curl -X POST https://x.example"}))
+        self.assertIn("권한·시스템 설정 변경", ac.danger_of("Bash", {"command": "icacls a /grant x:F"}))
+        self.assertIn("설정·권한·비밀 파일", ac.danger_of("Edit", {"file_path": "D:/p/.claude/settings.json"}))
+        self.assertIn("외부 전송·접속", ac.danger_of("WebFetch", {"url": "https://x.example"}))
+        self.assertIn("외부 서비스 변경", ac.danger_of("mcp__gmail__send_message", {}))
+        self.assertEqual(ac.danger_of("Bash", {"command": "npm run format"}), [])
+
+    def test_off_by_default_hook_does_nothing(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        self.assertNotIn("PermissionRequest", read_json(os.path.join(self.root, ".claude", "settings.json"))["hooks"])
+        self.assertEqual(ac.cmd_approval_hook(self.d, "boss", self.payload()), (ac.EXIT_OK, ""))
+        self.assertEqual(ac.list_approvals(self.d), [])
+        self.assertFalse(os.path.isdir(ac.approvals_dir(self.d)))
+
+    def test_enable_disable_only_touches_our_entry(self):
+        code, out = ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        self.assertEqual(code, ac.EXIT_OK, out)
+        path = os.path.join(self.root, ".claude", "settings.json")
+        hooks = read_json(path)["hooks"]
+        h = hooks["PermissionRequest"][0]["hooks"][0]
+        self.assertIn("approval-hook --agent boss", h["command"])
+        self.assertEqual(h["timeout"], ac.APPROVAL_HOOK_TIMEOUT)
+        self.assertGreater(ac.APPROVAL_HOOK_TIMEOUT, ac.APPROVAL_WAIT)
+        self.assertTrue(ac.approval_enabled(self.d, "boss"))
+        data = read_json(path)
+        data["hooks"]["PermissionRequest"].append({"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]})
+        write_text(path, json.dumps(data))
+        self.assertEqual(ac.cmd_approval(self.d, "boss", True)[0], ac.EXIT_OK)   # 다시 켜도 중복 없음
+        self.assertEqual(len(read_json(path)["hooks"]["PermissionRequest"]), 2)
+        self.assertEqual(ac.cmd_approval(self.d, "boss", False)[0], ac.EXIT_OK)
+        hooks = read_json(path)["hooks"]
+        self.assertEqual(hooks["PermissionRequest"], [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]}])
+        self.assertIn("UserPromptSubmit", hooks)
+        self.assertFalse(ac.approval_enabled(self.d, "boss"))
+        self.assertEqual(ac.cmd_approval_hook(self.d, "boss", self.payload()), (ac.EXIT_OK, ""))
+
+    def test_codex_and_agy(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat")
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        ac.cmd_add(self.d, "g", "agy", None, "achat")
+        code, out = ac.cmd_approval(self.d, "coder", True)
+        self.assertEqual(code, ac.EXIT_OK, out)
+        h = read_json(os.path.join(self.root, "coder", ".codex", "hooks.json"))["hooks"]["PermissionRequest"][0]["hooks"][0]
+        self.assertEqual(h["command"], h["commandWindows"])
+        self.assertEqual(ac.cmd_approval(self.d, "g", True)[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_approval(self.d, "nobody", True)[0], ac.EXIT_ERR)
+        self.assertEqual(ac.cmd_add(self.d, "g2", "agy", None, "achat", approval=True)[0], ac.EXIT_ERR)
+
+    def test_allow_roundtrip(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        t, box = self.run_hook()
+        req = self.wait_pending()[0]
+        self.assertEqual((req["agent"], req["tool"], req["summary"], req["reason"]), ("boss", "Bash", "npm test", "테스트 실행"))
+        self.assertEqual(req["danger"], [])
+        self.assertEqual(ac.answer_approval(self.d, req["id"], "allow")[0], "ok")
+        t.join(5)
+        code, out = box["r"]
+        self.assertEqual(code, ac.EXIT_OK)
+        self.assertEqual(json.loads(out), {"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}})
+        self.assertEqual(ac.list_approvals(self.d), [])
+        self.assertEqual(ac.answer_approval(self.d, req["id"], "deny")[0], "already")
+
+    def test_deny_has_message(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        t, box = self.run_hook(payload=self.payload("rm -rf /tmp/x"))
+        req = self.wait_pending()[0]
+        self.assertIn("삭제", req["danger"])
+        ac.answer_approval(self.d, req["id"], "deny")
+        t.join(5)
+        dec = json.loads(box["r"][1])["hookSpecificOutput"]["decision"]
+        self.assertEqual(dec, {"behavior": "deny", "message": ac.DENY_DEFAULT_MSG})
+        t, box = self.run_hook()
+        req = self.wait_pending()[0]
+        ac.answer_approval(self.d, req["id"], "deny", "테스트만 하세요\x07")
+        t.join(5)
+        self.assertEqual(json.loads(box["r"][1])["hookSpecificOutput"]["decision"]["message"], "테스트만 하세요")
+
+    def test_pass_and_timeout_fall_back_to_popup(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        t, box = self.run_hook()
+        req = self.wait_pending()[0]
+        self.assertEqual(ac.answer_approval(self.d, req["id"], "pass")[0], "ok")
+        t.join(5)
+        self.assertEqual(box["r"], (ac.EXIT_OK, ""))
+        os.environ["AGENTCHAT_APPROVAL_WAIT"] = "1"
+        t0 = time.time()
+        self.assertEqual(ac.cmd_approval_hook(self.d, "boss", self.payload(), interval=0.05), (ac.EXIT_OK, ""))
+        self.assertLess(time.time() - t0, 5)
+        rid = [f for f in os.listdir(ac.approvals_dir(self.d)) if f.endswith(".req.json") and req["id"] not in f][0][:16]
+        self.assertEqual(ac.read_approval(self.d, rid, "res")["behavior"], "expired")
+        self.assertEqual(ac.answer_approval(self.d, rid, "allow")[0], "already")
+
+    def test_late_ui_answer_after_expiry_is_refused(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        req = ac.new_approval(self.d, "boss", self.payload())
+        r = ac.read_approval(self.d, req["id"], "req")
+        r["expires"] = time.time() - 1
+        write_text(ac.approval_path(self.d, req["id"], "req"), json.dumps(r))
+        self.assertEqual(ac.list_approvals(self.d), [])
+        self.assertEqual(ac.count_pending(self.d), 0)
+        self.assertEqual(ac.answer_approval(self.d, req["id"], "allow")[0], "expired")
+        ac.new_approval(self.d, "boss", self.payload())
+        self.assertEqual(ac.count_pending(self.d), 1)
+
+    def test_answer_validation(self):
+        self.assertEqual(ac.answer_approval(self.d, "../../etc", "allow")[0], "bad")
+        self.assertEqual(ac.answer_approval(self.d, "0123456789abcdef", "maybe")[0], "bad")
+        self.assertEqual(ac.answer_approval(self.d, "0123456789abcdef", "expired")[0], "bad")   # UI 는 expired 를 못 쓴다
+        self.assertEqual(ac.answer_approval(self.d, "0123456789abcdef", "allow")[0], "missing")
+
+    def test_paused_and_bad_payload_return_no_decision(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        self.assertEqual(ac.cmd_approval_hook(self.d, "boss", {}), (ac.EXIT_OK, ""))
+        ac.cmd_pause(self.d)
+        self.assertEqual(ac.cmd_approval_hook(self.d, "boss", self.payload()), (ac.EXIT_OK, ""))
+        self.assertEqual(ac.list_approvals(self.d), [])
+
+    def test_cleanup_old_files(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        req = ac.new_approval(self.d, "boss", self.payload())
+        ac.answer_approval(self.d, req["id"], "allow")
+        keep = ac.new_approval(self.d, "boss", self.payload())
+        old = time.time() - ac.APPROVAL_KEEP - ac.APPROVAL_HOOK_TIMEOUT - 5
+        for ext in ("req", "res"):
+            os.utime(ac.approval_path(self.d, req["id"], ext), (old, old))
+        write_text(os.path.join(ac.approvals_dir(self.d), "notes.txt"), "x")
+        self.assertEqual(ac.cleanup_approvals(self.d), 2)
+        self.assertEqual([r["id"] for r in ac.list_approvals(self.d)], [keep["id"]])
+        self.assertTrue(os.path.exists(os.path.join(ac.approvals_dir(self.d), "notes.txt")))
+
+    def test_request_fields_are_bounded_and_clean(self):
+        ac.cmd_add(self.d, "boss", "claude", None, "achat", approval=True)
+        req = ac.new_approval(self.d, "boss", self.payload("echo " + "가" * 5000 + "\x1b[31m"))
+        self.assertLessEqual(len(req["summary"]), ac.APPROVAL_SUMMARY_MAX)
+        self.assertLessEqual(len(req["input"]), ac.APPROVAL_INPUT_MAX)
+        self.assertNotIn("\x1b", req["input"])
+        self.assertRegex(req["id"], ac.APPROVAL_ID_RE)
+
+    def test_cli_hook_never_fails(self):
+        env = dict(os.environ, AGENTCHAT_DIR=self.d, AGENTCHAT_AGENT="boss")
+        for stdin in (b"not json", b"[1,2]", b""):
+            p = subprocess.run([sys.executable, SCRIPT, "approval-hook"], input=stdin, capture_output=True, env=env, timeout=20)
+            self.assertEqual((p.returncode, p.stdout), (0, b""))
+
+    def test_lock_retries_transient_permission_error(self):
+        # agy 창에서 실제로 난 오류: .lock 열기가 잠깐 PermissionError(EACCES)로 실패
+        from unittest import mock
+        real, n = open, [0]
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith(".lock") and n[0] < 3:
+                n[0] += 1
+                raise PermissionError(13, "Permission denied", path)
+            return real(path, *a, **kw)
+        with mock.patch.object(ac, "open", flaky, create=True):
+            with ac.locked(self.d):
+                pass
+        self.assertEqual(n[0], 3)
+
+    def test_reset_topic_refuses_folder_without_chat(self):
+        # 승인 작업 중 발견: 홈 폴더에서 reset-topic 을 실행하면 빈 대화 폴더를 새로 만들어 거기를 초기화했다
+        other = os.path.join(self.tmp.name, "elsewhere", ".collab", "chat")
+        code, out = ac.cmd_reset_topic(other, "review")
+        self.assertEqual(code, ac.EXIT_ERR)
+        self.assertIn("--dir", out)
+        self.assertFalse(os.path.exists(other))
+        self.send("a", "b", topic="review")
+        code, out = ac.cmd_reset_topic(self.d, "review")
+        self.assertEqual(code, ac.EXIT_OK)
+        self.assertIn(self.d, out)
+
+
+class TestDashboardCore(Base):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "proj")
+        self.d = os.path.join(self.root, ".collab", "chat")
+        ac.cmd_init(self.d)
+        self.clean_env()
+        for n, k in (("boss", "claude"), ("coder", "codex"), ("g", "agy")):
+            ac.cmd_add(self.d, n, k, None, "achat")
+            time.sleep(0.01)   # added 순서가 확실히 갈리게
+        self.calls = []
+
+    def fake(self, have=("claude", "codex", "agy", "wt")):
+        from unittest import mock
+        which = mock.patch.object(ac.shutil, "which", lambda c: ("C:/bin/" + c) if c in have else None)
+        popen = mock.patch.object(ac.subprocess, "Popen", lambda args, **kw: self.calls.append((args, kw)))
+        nt = mock.patch.object(ac.os, "name", "nt")
+        return which, popen, nt
+
+    def run_launch(self, names=None, have=("claude", "codex", "agy", "wt")):
+        which, popen, nt = self.fake(have)
+        with which, popen:
+            if os.name == "nt":
+                return ac.launch_all(self.d, names)
+            with nt:   # 다른 OS 에서도 wt 경로를 검사한다(Popen 은 가짜라 실제로 띄우지 않음)
+                try:
+                    return ac.launch_all(self.d, names)
+                except AttributeError:
+                    self.skipTest("이 OS 에는 CREATE_NEW_CONSOLE 이 없음")
+
+    def test_wt_args_equal_widths(self):
+        a = ac.wt_args([("a", "C:\\p\\a\\", "claude"), ("b", "C:\\p\\b", "codex"), ("c", "C:\\", "agy")])
+        self.assertEqual(a[:3], ["-w", "new", "new-tab"])
+        self.assertEqual(a.count(";"), 2)
+        sizes = [a[i + 1] for i, x in enumerate(a) if x == "--size"]
+        self.assertEqual(sizes, ["0.667", "0.500"])     # 1/3, 1/3, 1/3
+        self.assertIn("C:\\p\\a", a)                       # 끝의 \ 제거
+        self.assertIn("C:\\", a)                           # 드라이브 루트는 그대로
+        self.assertEqual([a[i + 1] for i, x in enumerate(a) if x == "--title"], ["a", "b", "c"])
+
+    def test_launch_all_one_window(self):
+        ok, msg = self.run_launch()
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.calls), 1)
+        args = self.calls[0][0]
+        self.assertEqual(args[0], "C:/bin/wt")
+        self.assertEqual([args[i + 1] for i, x in enumerate(args) if x == "--title"], ["boss", "coder", "g"])
+        clis = [args[i + 1] for i, x in enumerate(args) if x == "/k"]
+        self.assertEqual(clis, ["claude", "codex", "agy"])
+        self.assertIn("3칸", msg)
+
+    def test_launch_selected_and_missing_cli(self):
+        ok, msg = self.run_launch(["coder", "g", "nobody"], have=("codex", "wt"))
+        self.assertTrue(ok, msg)
+        args = self.calls[0][0]
+        self.assertEqual([args[i + 1] for i, x in enumerate(args) if x == "--title"], ["coder"])
+        self.assertIn("g(`agy` 없음)", msg)
+        self.calls.clear()
+        ok, msg = self.run_launch(have=("wt",))
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+
+    def test_fallback_without_wt(self):
+        ok, msg = self.run_launch(have=("claude", "codex", "agy"))
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.calls), 3)
+        self.assertIn("따로", msg)
+
+    def test_cli_open_all_needs_agents(self):
+        code, out = ac.run(["--dir", os.path.join(self.tmp.name, "empty", ".collab", "chat"), "open-all"])
+        self.assertEqual(code, ac.EXIT_ERR)
+
+    def test_agent_activity(self):
+        ac.cmd_send(self.d, "boss", "coder", "t", "hi")
+        ac.cmd_send(self.d, "coder", "boss", "t", "re")
+        ac.cmd_inbox(self.d, "boss")
+        req = {"agent": "g", "id": "0" * 16}
+        st = ac.agent_activity(self.d, ac.read_messages(self.d), [req])
+        self.assertEqual(st["coder"]["state"], "unread")
+        self.assertEqual(st["boss"]["state"], "idle")
+        self.assertEqual(st["g"]["state"], "approval")
+        self.assertEqual(st["g"]["pending_approvals"], 1)
+        self.assertIsNone(st["g"]["last_active"])
+        self.assertGreater(st["coder"]["last_active"], 0)
+        self.assertGreaterEqual(st["boss"]["last_to_me"], st["coder"]["last_to_me"])
+        self.assertEqual(set(ac.agent_activity(self.d, [], [], ["x"])), {"x"})
+
+
+class TestApprovalServer(Base):
+    ENV_KEYS = TestUI.ENV_KEYS
+    setUp = TestUI.setUp
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        ac.launch_terminal, ac.pick_folder = self._orig
+        super().tearDown()
+
+    req = TestUI.req
+    post = TestUI.post
+
+    def request_file(self, danger=None, expired=False):
+        ident = '1234567890abcdef'
+        folder = os.path.join(self.d, 'approvals')
+        os.makedirs(folder, exist_ok=True)
+        now = time.time()
+        req = dict(id=ident, agent='codex', kind='codex', tool='Bash',
+                   summary='echo test', reason='test', input='{}', cwd=self.root,
+                   t=now-200 if expired else now, expires=now-1 if expired else now+120,
+                   danger=danger or [])
+        write_text(os.path.join(folder, ident+'.req.json'), json.dumps(req))
+        return dict(p=self.root, id=ident, behavior='allow')
+
+    def test_listing_and_state(self):
+        data = self.request_file()
+        code, raw, _ = self.req('/api/approvals?p='+urllib.parse.quote(self.root))
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(raw)['approvals'][0]['id'], data['id'])
+        self.assertEqual(ac.ui_state(self.d)['approvals'][0]['id'], data['id'])
+
+    def test_allow_and_duplicate(self):
+        data = self.request_file()
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'ok')
+        data['behavior'] = 'deny'
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'already')
+        res = read_json(os.path.join(self.d, 'approvals', data['id']+'.res.json'))
+        self.assertEqual(res['behavior'], 'allow')
+
+    def test_danger_confirmation(self):
+        data = self.request_file(['deletion'])
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'confirm')
+        self.assertFalse(os.path.exists(os.path.join(self.d, 'approvals', data['id']+'.res.json')))
+        data['confirm'] = 'true'
+        self.assertEqual(self.post('/api/approve', data)[0], 400)
+        data['confirm'] = True
+        data['behavior'] = 'deny'
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'ok')
+
+    def test_expired_and_missing(self):
+        data = self.request_file(expired=True)
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'expired')
+        data['id'] = 'ffffffffffffffff'
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'missing')
+
+    def test_token_host_origin(self):
+        data = self.request_file()
+        for kwargs in [dict(token=None), dict(token='wrong'),
+                       dict(host='evil.example'), dict(host='localhost:1'),
+                       dict(headers={'Origin':'null'}),
+                       dict(headers={'Origin':'https://127.0.0.1:%s'%self.port}),
+                       dict(headers={'Origin':'http://evil.example'}),
+                       dict(headers={'Origin':'http://user@127.0.0.1:%s'%self.port})]:
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(self.post('/api/approve', data, **kwargs)[0], 403)
+        self.assertEqual(self.post('/api/approve', data,
+                         headers={'Origin':'http://127.0.0.1:%s'%self.port})[1]['status'], 'ok')
+
+    def test_validation(self):
+        data = self.request_file()
+        for change in [dict(id='../file'), dict(behavior='expired'), dict(message=[]),
+                       dict(message='x'*2001), dict(p=[]), dict(confirm=1)]:
+            with self.subTest(change=change):
+                self.assertEqual(self.post('/api/approve', dict(data, **change))[0], 400)
+        self.assertEqual(self.post('/api/approve', data, ctype='text/application/json')[0], 415)
+        self.assertEqual(self.post('/api/approve', dict(data, p=self.tmp.name))[0], 404)
+        self.assertEqual(self.req('/api/approve')[0], 404)
+
+    def test_deny_does_not_need_danger_confirmation(self):
+        data = self.request_file(['deletion'])
+        data['behavior'] = 'deny'
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'ok')
+
+    def test_expired_danger_does_not_request_confirmation(self):
+        data = self.request_file(['deletion'], expired=True)
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'expired')
+
+    def test_lock_error_is_json(self):
+        from unittest.mock import patch
+        data = self.request_file()
+        with patch.object(ac, 'answer_approval', side_effect=RuntimeError('locked')):
+            code, result = self.post('/api/approve', data)
+        self.assertEqual(code, 500)
+        self.assertEqual(result['status'], 'error')
+
+    def test_pass_does_not_need_danger_confirmation(self):
+        data = self.request_file(['deletion'])
+        data['behavior'] = 'pass'
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'ok')
+
+    def test_project_pending_count(self):
+        self.request_file()
+        code, raw, _ = self.req('/api/projects')
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(raw)['projects'][0]['pending'], 1)
+
+    def test_concurrent_answers_have_one_winner(self):
+        from concurrent.futures import ThreadPoolExecutor
+        data = self.request_file()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            answers = list(pool.map(lambda b: self.post('/api/approve', dict(data, behavior=b))[1],
+                                    ['allow', 'deny']))
+        self.assertEqual(sorted(r['status'] for r in answers), ['already', 'ok'])
+
+    def test_paused(self):
+        data = self.request_file()
+        ac.cmd_pause(self.d)
+        self.assertEqual(self.post('/api/approve', data)[1]['status'], 'paused')
+
+
+class TestApprovalPage(Base):
+    def test_page_elements_and_no_innerhtml(self):
+        html = ac.UI_HTML
+        self.assertIn('id="approvals"', html)
+        self.assertIn('id="appempty"', html)
+        self.assertIn('승인 대기 중인 요청이 없습니다.', html)
+        self.assertIn('renderApprovals', html)
+        self.assertIn('sendApprove', html)
+        self.assertIn('/api/approve', html)
+        self.assertIn('터미널에서 답하기', html)
+        self.assertIn('위험 요청', html)
+        self.assertIn('updateTitle', html)
+        self.assertIn('appBusy', html)
+        self.assertIn('appErr', html)
+        self.assertNotIn('innerHTML', html)
+
+
+class TestDashboardPage(Base):
+    def test_dashboard_elements_and_three_column_layout(self):
+        html = ac.UI_HTML
+        self.assertIn('id="openallbtn"', html)
+        self.assertIn('모두 한 창에 열기', html)
+        self.assertIn('/api/agents/open-all', html)
+        self.assertIn('openAllBusy', html)
+        self.assertIn('id="apppane"', html)
+        self.assertIn('id="afilter"', html)
+        self.assertIn('setAgent', html)
+        self.assertIn('relTime', html)
+        self.assertIn('sdot', html)
+        self.assertIn('grid-template-columns:272px minmax(0,1fr) 340px', html)
+        self.assertNotIn('innerHTML', html)
+
+
+class TestDashboardServer(Base):
+    ENV_KEYS = TestUI.ENV_KEYS
+    setUp = TestUI.setUp
+    req = TestUI.req
+    post = TestUI.post
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        ac.launch_terminal, ac.pick_folder = self._orig
+        super().tearDown()
+
+    def test_launch_all_and_selected(self):
+        from unittest.mock import patch
+        ac.save_roster(self.d, {'coder': {'kind': 'codex', 'dir': '.'}})
+        with patch.object(ac, 'launch_all', return_value=(True, 'opened')) as launch:
+            code, result = self.post('/api/agents/open-all', {'p': self.root})
+            self.assertEqual(code, 200)
+            self.assertTrue(result['ok'])
+            launch.assert_called_once_with(self.d, None)
+            launch.reset_mock()
+            self.srv.open_all_recent.clear()
+            self.post('/api/agents/open-all', {'p': self.root, 'names': ['coder', 'coder']})
+            launch.assert_called_once_with(self.d, ['coder'])
+
+    def test_invalid_requests_do_not_launch(self):
+        from unittest.mock import patch
+        with patch.object(ac, 'launch_all') as launch:
+            for value in [None, [], 'coder', [1], ['x']*21, ['../bad'], ['unknown']]:
+                with self.subTest(value=value):
+                    self.assertEqual(self.post('/api/agents/open-all', {'p': self.root, 'names': value})[0], 400)
+            self.assertEqual(self.post('/api/agents/open-all', {'p': []})[0], 400)
+            self.assertEqual(self.post('/api/agents/open-all', {'p': self.tmp.name})[0], 404)
+            launch.assert_not_called()
+
+    def test_protected_and_failure_response(self):
+        from unittest.mock import patch
+        with patch.object(ac, 'launch_all', side_effect=OSError('unavailable')) as launch:
+            for kwargs in [dict(token=None), dict(host='evil.example'), dict(headers={'Origin': 'null'})]:
+                self.assertEqual(self.post('/api/agents/open-all', {'p': self.root}, **kwargs)[0], 403)
+            launch.assert_not_called()
+            code, result = self.post('/api/agents/open-all', {'p': self.root})
+            self.assertEqual(code, 500)
+            self.assertFalse(result['ok'])
+
+    def test_repeated_and_concurrent_launch_is_blocked(self):
+        from unittest.mock import patch
+        from concurrent.futures import ThreadPoolExecutor
+        entered, release = threading.Event(), threading.Event()
+        def launch(*args):
+            entered.set()
+            release.wait(3)
+            return True, 'opened'
+        with patch.object(ac, 'launch_all', side_effect=launch) as mocked:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(self.post, '/api/agents/open-all', {'p': self.root})
+                self.assertTrue(entered.wait(2))
+                try:
+                    self.assertEqual(self.post('/api/agents/open-all', {'p': self.root})[0], 429)
+                finally:
+                    release.set()
+                self.assertTrue(first.result()[1]['ok'])
+            self.assertEqual(self.post('/api/agents/open-all', {'p': self.root})[0], 429)
+            mocked.assert_called_once()
+
+    def test_unregistered_message_participant_has_activity(self):
+        self.send('writer', 'reader', 'hello')
+        state = ac.ui_state(self.d)
+        self.assertEqual(state['agents']['reader']['state'], 'unread')
+        self.assertIsNotNone(state['agents']['writer']['last_active'])
+
+    def test_activity_merges_and_reuses_snapshot(self):
+        from unittest.mock import patch
+        ac.save_roster(self.d, {'coder': {'kind': 'codex', 'dir': '.', 'approval': True}})
+        approvals = [{'id': '1234567890abcdef', 'agent': 'coder'}]
+        details = {'last_active': 123, 'last_to_me': 122, 'pending_approvals': 1, 'state': 'approval'}
+        with patch.object(ac, 'list_approvals', return_value=approvals) as listing, \
+                patch.object(ac, 'agent_activity', return_value={'coder': details}) as activity:
+            state = ac.ui_state(self.d)
+            listing.assert_called_once_with(self.d)
+            self.assertIs(activity.call_args.args[2], approvals)
+        for key, value in details.items():
+            self.assertEqual(state['agents']['coder'][key], value)
+        self.assertTrue(state['agents']['coder']['approval'])
 
 
 if __name__ == "__main__":
