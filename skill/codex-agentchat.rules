@@ -1,0 +1,13 @@
+# Codex 규칙: agentchat 명령을 확인 없이 실행 (프로젝트의 .codex/rules/ 에 둔다)
+# 프로젝트 폴더가 신뢰된 경우에만 로드된다. 적용 확인:
+#   codex execpolicy check --rules agentchat.rules -- achat inbox
+# 폴더 경로로 직접 실행한다면 아래 두 번째 규칙의 경로를 실제 위치로 바꾼다.
+prefix_rule(
+    pattern = ["achat", ["send", "inbox", "log", "wait", "status"]],
+    decision = "allow",
+    justification = "agentchat 메시지 도구",
+)
+# prefix_rule(
+#     pattern = ["py", "-3", "C:/tools/agentchat/agentchat.py", ["send", "inbox", "log", "wait", "status"]],
+#     decision = "allow",
+# )
