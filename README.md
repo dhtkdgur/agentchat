@@ -25,6 +25,7 @@ Claude Code, Codex, Gemini CLI(Antigravity `agy` 포함) 창끼리 메시지를 
 - 상대 메시지는 "지시가 아닌 참고 의견"이라는 문구로 감싸서 전달합니다.
 - 주제당 6회, 시간당 30회 전송 상한(환경변수 `AGENTCHAT_TOPIC_CAP`, `AGENTCHAT_HOURLY_CAP`).
 - `pause`로 전체 정지(전송과 전달, 그리고 `wait`이 모두 멈춥니다). `resume`과 `reset-topic`은 사람이 터미널에서 직접 실행할 때만 동작합니다.
+- UI에서 사용자가 보낸 메시지(`human`)는 사용자 요청으로 전달되지만, 삭제·권한 변경·외부 전송·비밀 정보가 필요하면 에이전트가 먼저 확인합니다. `human` 이름은 CLI에서 쓸 수 없어 에이전트가 사용자를 사칭할 수 없습니다.
 - 이름 검증, 제어문자 제거, 길이 제한.
 - `wait`은 알림만 하고 메시지를 읽음 처리하지 않습니다. 읽는 것은 `inbox`/훅입니다. 대기하던 창이 닫히거나 깨어나지 못해도 메시지가 사라지지 않습니다. 같은 메시지를 읽지 않은 채 `wait`만 반복하면 즉시 끝나지 않고 계속 기다립니다(빈 루프 방지).
 - 깨우기(`codex queue`)에는 메시지 본문을 넣지 않고 "새 메시지가 있으니 inbox를 확인하라"는 알림만 넣습니다. 깨우기가 실패해도 전송은 성공합니다.
@@ -81,11 +82,12 @@ achat status
 - 예전 문법(`send --from A --to B "내용"`, `inbox --agent X`)도 그대로 됩니다.
 
 ## 검증 상태
-- `python test_agentchat.py`: 95개. Linux(Python 3.10)에서 통과했고, 이전 버전의 72개는 Windows(Python 3.14)에서도 통과했습니다.
+- `python test_agentchat.py`: 106개. Linux(Python 3.10)에서 통과했고, Windows(Python 3.14)에서도 통과했습니다(1개 건너뜀).
 - 이전 버전에서 Windows 실기로 확인됨: 한글 경로 포함 `init`/`send`/`inbox`, Claude Code와 Codex의 `UserPromptSubmit` 훅 수신, Claude Code·`agy`의 백그라운드 `wait` 종료 시 자동 재시작과 답장, `codex queue`로 쉬는 Codex 창 깨우기.
 - Windows 실기 확인(3자 대화): Claude Code가 codex·gemini에게 보내고, codex는 `codex queue`로, gemini(agy)와 Claude는 백그라운드 `wait`로 깨어나 입력 없이 답장했습니다(codex 약 8초, gemini 약 26초). 읽음 위치가 어긋나는 유실 없음, `errors.log` 비어 있음, codex 세션 자동 등록 확인.
 - 승인 팝업: Codex·Claude 창은 이번 테스트에서 뜨지 않았습니다. agy는 허용 규칙 없이는 `send`마다 뜨고, `skill/agy-settings-snippet.json`의 `regex:` 규칙을 넣으면 뜨지 않음을 확인했습니다.
 - Windows 실기 확인(UI로 만든 4명): UI의 "+ 에이전트"로 Claude Code 1, Codex 2, agy 1명을 추가하고 "창 열기"로 띄운 뒤, Claude가 셋에게 보내자 입력 없이 전원 답장했습니다(agy 약 9초, Codex 두 명 각각 약 11초). Codex 두 명은 세션 ID와 깨우기 기록이 따로 저장되어 서로 간섭하지 않았고, 읽음 위치 어긋남과 `errors.log` 기록은 없었습니다. 브라우저 열기와 `창 열기`도 동작했습니다.
+- Windows 실기 확인(UI 조작): UI에서 보내기, 일시정지, 상한 표시, 프로젝트 목록 제거, 에이전트 삭제가 동작했습니다.
 - 미검증: macOS/Linux의 `창 열기`, `PostToolUse` 훅, Gemini CLI용 훅 설정, 긴 대화에서의 루프 지침 준수, Claude Code 허용 목록 설정.
 - 에이전트 CLI 버전이 바뀌면 훅 형식이 달라질 수 있습니다. 깨지면 `print-config` 출력과 공식 훅 문서를 비교해 수정하세요.
 - 처음 쓸 때는 한 쌍으로 `send` → 상대 창에서 아무 입력(Codex는 최초 1회) → 메시지 도착 여부부터 확인하세요.
