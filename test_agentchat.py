@@ -748,6 +748,117 @@ class TestUI(Base):
         self.assertEqual(ac.ui_state(self.d, after=1)["messages"][0]["id"], 2)
         self.assertEqual(ac.ui_state(self.d, after=2)["messages"], [])
 
+    def test_api_send_as_human(self):
+        code, j = self.post("/api/send", {"p": self.root, "to": ["codex", "claude"], "topic": "ui", "body": "작업 시작해"})
+        self.assertEqual(code, 200)
+        self.assertTrue(j["ok"], j)
+        msgs = ac.read_messages(self.d)
+        self.assertEqual([(m["from"], m["to"], m.get("human")) for m in msgs],
+                         [("human", "codex", True), ("human", "claude", True)])
+        txt = ac.cmd_inbox(self.d, "codex")[1]
+        self.assertIn("사용자가 UI에서 직접 보낸", txt)
+        self.assertIn("다시 확인", txt)
+
+    def test_api_send_bypasses_caps_and_not_counted(self):
+        for i in range(ac.topic_cap() + 3):
+            code, j = self.post("/api/send", {"p": self.root, "to": ["codex"], "topic": "cap", "body": "m%d" % i})
+            self.assertTrue(j["ok"], j)
+        self.assertEqual(ac.topic_count(ac.read_messages(self.d), "cap"), 0)
+        self.assertEqual(self.send("claude", "codex", "ok", topic="cap")[0], ac.EXIT_OK)
+
+    def test_api_send_refused_when_paused(self):
+        ac.cmd_pause(self.d)
+        code, j = self.post("/api/send", {"p": self.root, "to": ["codex"], "body": "x"})
+        self.assertFalse(j["ok"])
+        self.assertEqual(ac.read_messages(self.d), [])
+
+    def test_api_send_needs_token_and_valid_input(self):
+        code, _ = self.post("/api/send", {"p": self.root, "to": ["codex"], "body": "x"}, token=None)
+        self.assertEqual(code, 403)
+        code, j = self.post("/api/send", {"p": self.root, "to": [], "body": "x"})
+        self.assertFalse(j["ok"])
+        code, j = self.post("/api/send", {"p": self.root, "to": ["../x"], "body": "x"})
+        self.assertFalse(j["ok"])
+        code, j = self.post("/api/send", {"p": os.path.join(self.tmp.name, "other"), "to": ["codex"], "body": "x"})
+        self.assertEqual(code, 404)
+
+    def test_cli_cannot_impersonate_human(self):
+        code, out = ac.cmd_send(self.d, "human", "codex", "t", "위조")
+        self.assertEqual(code, ac.EXIT_ERR)
+        self.assertEqual(ac.read_messages(self.d), [])
+        code, out = ac.cmd_add(self.d, "human", "codex", None, "achat")
+        self.assertEqual(code, ac.EXIT_ERR)
+
+    def test_agent_can_reply_to_human(self):
+        code, _ = self.send("claude", "human", "끝났습니다")
+        self.assertEqual(code, ac.EXIT_OK)
+        st = ac.ui_state(self.d)
+        self.assertNotIn("human", st["agents"])
+
+    def test_api_pause_and_state_limits(self):
+        self.send("claude", "codex", "a", topic="x")
+        st = ac.ui_state(self.d)
+        self.assertEqual(st["limits"]["topics"]["x"], {"used": 1, "cap": ac.topic_cap()})
+        self.assertEqual(st["limits"]["hourly"]["claude"], 1)
+        self.assertEqual(st["limits"]["hourly_cap"], ac.hourly_cap())
+        self.assertFalse(st["paused"])
+        code, j = self.post("/api/pause", {"p": self.root})
+        self.assertTrue(j["ok"], j)
+        self.assertTrue(ac.ui_state(self.d)["paused"])
+        code, raw, _ = self.req("/api/resume", "POST", body={"p": self.root})
+        self.assertEqual(code, 404)
+        self.assertTrue(ac.ui_state(self.d)["paused"])
+
+    def test_refresh_rules_rewrites_block(self):
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        fp, _ = ac.agent_folder(self.d, "coder")
+        path = os.path.join(fp, "AGENTS.md")
+        txt = read_text(path)
+        write_text(path, txt.replace("`human`", "OLD"))
+        code, out = ac.cmd_refresh_rules(self.d, "achat")
+        self.assertEqual(code, ac.EXIT_OK, out)
+        self.assertIn("`human`", read_text(path))
+
+    def test_remove_agent_via_api(self):
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        fp, _ = ac.agent_folder(self.d, "coder")
+        ac.cmd_add(self.d, "coder2", "codex", None, "achat")
+        fp2, _ = ac.agent_folder(self.d, "coder2")
+        self.send("claude", "coder2", "기록 유지")
+        ac.cmd_inbox(self.d, "coder2")
+        code, j = self.post("/api/agent/remove", {"p": self.root, "name": "coder2"})
+        self.assertTrue(j["ok"], j)
+        self.assertNotIn("coder2", ac.load_roster(self.d))
+        self.assertFalse(os.path.exists(os.path.join(fp2, ".agentchat-me")))
+        self.assertFalse(os.path.exists(os.path.join(fp2, "AGENTS.md")))
+        self.assertTrue(os.path.isdir(fp2))
+        self.assertEqual(len(ac.read_messages(self.d)), 1)
+        self.assertNotIn("coder2", ac.ui_state(self.d)["agents"])
+        self.assertIn("coder", ac.ui_state(self.d)["agents"])
+        self.assertIn("agentchat:start", read_text(os.path.join(fp, "AGENTS.md")))
+        code, j = self.post("/api/agent/remove", {"p": self.root, "name": "nobody"})
+        self.assertFalse(j["ok"])
+        ac.cmd_add(self.d, "coder2", "codex", None, "achat")
+        self.assertIn("coder2", ac.ui_state(self.d)["agents"])
+
+    def test_remove_keeps_user_text_in_instruction_file(self):
+        ac.cmd_add(self.d, "coder", "codex", None, "achat")
+        fp, _ = ac.agent_folder(self.d, "coder")
+        path = os.path.join(fp, "AGENTS.md")
+        write_text(path, "내 메모\n" + read_text(path))
+        ac.cmd_remove(self.d, "coder")
+        self.assertEqual(read_text(path).strip(), "내 메모")
+
+    def test_remove_project_only_unregisters(self):
+        code, j = self.post("/api/project/remove", {"path": self.root})
+        self.assertTrue(j["ok"], j)
+        self.assertEqual(ac.load_projects(), [])
+        self.assertTrue(os.path.isdir(self.d))
+        code, j = self.post("/api/project/remove", {"path": self.root})
+        self.assertEqual(code, 404)
+        code, j = self.post("/api/project/remove", {"path": self.root}, token=None)
+        self.assertEqual(code, 403)
+
     def test_state_does_not_mark_read(self):
         self.send("claude", "codex", "x")
         ac.ui_state(self.d)
